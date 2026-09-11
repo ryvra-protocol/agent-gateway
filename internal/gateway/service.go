@@ -2,12 +2,13 @@ package gateway
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,270 +23,253 @@ type authenticatedActor struct {
 	Admin   bool
 }
 
-type Service struct {
-	mu                 sync.RWMutex
-	cfg                Config
-	agents             map[string]Agent
-	credentialsByID    map[string]AgentCredential
-	credentialsByToken map[string]string
-	capabilities       map[string]AgentCapability
-	mandates           map[string]AgentMandate
-	intents            map[string]IntentRecord
-	idempotency        map[string]string
-	nonces             map[string]time.Time
-	agentRequests      map[string][]time.Time
-	agentSpend         map[string][]spendEntry
-	auditEvents        []AuditEvent
-	lastAuditHash      string
-	killSwitch         bool
-	preventionSignals  []string
-	nextID             int
+type PolicyRiskResolver interface {
+	Resolve(intent FinancialIntent, authority AuthorityReferences) (AuthorityReferences, error)
 }
 
-type spendEntry struct {
-	At     time.Time
-	Amount float64
+type StaticPolicyRiskResolver struct {
+	Lookups map[string]AuthorityReferences
 }
 
-func NewService(cfg Config) *Service {
-	return &Service{
-		cfg:                cfg,
-		agents:             map[string]Agent{},
-		credentialsByID:    map[string]AgentCredential{},
-		credentialsByToken: map[string]string{},
-		capabilities:       map[string]AgentCapability{},
-		mandates:           map[string]AgentMandate{},
-		intents:            map[string]IntentRecord{},
-		idempotency:        map[string]string{},
-		nonces:             map[string]time.Time{},
-		agentRequests:      map[string][]time.Time{},
-		agentSpend:         map[string][]spendEntry{},
+func (r StaticPolicyRiskResolver) Resolve(intent FinancialIntent, authority AuthorityReferences) (AuthorityReferences, error) {
+	if completeAuthority(authority) {
+		if !isValidPolicyOutcome(authority.Outcome) {
+			return AuthorityReferences{}, errors.New("invalid policy outcome")
+		}
+		authority.LookupKey = ""
+		return authority, nil
 	}
+	if authority.LookupKey != "" {
+		resolved, ok := r.Lookups[authority.LookupKey]
+		if !ok || !completeAuthority(resolved) || !isValidPolicyOutcome(resolved.Outcome) {
+			return AuthorityReferences{}, errors.New("unverifiable policy/risk linkage")
+		}
+		resolved.LookupKey = authority.LookupKey
+		return resolved, nil
+	}
+	return AuthorityReferences{}, errors.New("missing authoritative policy/risk linkage")
+}
+
+type Repository interface {
+	SeedAgent(agent Agent) error
+	SeedCredential(credential AgentCredential) error
+	SeedCapability(capability AgentCapability) error
+	SeedMandate(mandate AgentMandate) error
+	AuthenticateAgent(tokenHash, sessionID string, now time.Time) (authenticatedActor, error)
+	GetAgent(agentID string) (Agent, bool, error)
+	GetCapability(capabilityID string) (AgentCapability, bool, error)
+	GetMandate(mandateID string) (AgentMandate, bool, error)
+	GetIntent(intentID string) (IntentRecord, bool, error)
+	ListAuditEvents(intentID string) ([]AuditEvent, error)
+	VerifyAuditIntegrity() (bool, error)
+	KillSwitchActive() (bool, error)
+	CountRecentActions(agentID string, since time.Time) (int, error)
+	SumRecentApprovedSpend(agentID string, since time.Time) (float64, error)
+	FindActionByIdempotency(agentID, key string) (IntentRecord, bool, error)
+	FindActionByReplay(agentID, nonce, replayBucket string) (IntentRecord, bool, error)
+	SaveIntent(record IntentRecord) error
+	UpdateIntent(record IntentRecord) error
+	RecordAuthorization(intentID string, authority AuthorityReferences, policyVersion string, now time.Time) error
+	AppendAudit(event AuditEvent, payload map[string]interface{}) error
+	SuspendAgent(agentID string, now time.Time) error
+	RevokeAgentCredentials(agentID string, now time.Time) error
+	RevokeCapability(capabilityID string, now time.Time) error
+}
+
+type Service struct {
+	repo      Repository
+	resolver  PolicyRiskResolver
+	cfg       Config
+	sequence  atomic.Uint64
+}
+
+func NewService(cfg Config, repo Repository, resolver PolicyRiskResolver) *Service {
+	if resolver == nil {
+		resolver = StaticPolicyRiskResolver{}
+	}
+	return &Service{cfg: cfg, repo: repo, resolver: resolver}
 }
 
 func (s *Service) SeedAgent(agent Agent) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if agent.RateLimit == 0 {
-		agent.RateLimit = s.cfg.DefaultRateLimit
-	}
-	if agent.SpendLimit == 0 {
-		agent.SpendLimit = s.cfg.DefaultSpendLimit
-	}
-	if agent.ReviewLimit == 0 {
-		agent.ReviewLimit = s.cfg.DefaultReviewLimit
-	}
-	s.agents[agent.ID] = agent
+	_ = s.repo.SeedAgent(agent)
 }
 
 func (s *Service) SeedCredential(credential AgentCredential) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.credentialsByID[credential.ID] = credential
-	s.credentialsByToken[credential.Token] = credential.ID
+	_ = s.repo.SeedCredential(credential)
 }
 
 func (s *Service) SeedCapability(capability AgentCapability) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.capabilities[capability.ID] = capability
+	_ = s.repo.SeedCapability(capability)
 }
 
 func (s *Service) SeedMandate(mandate AgentMandate) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.mandates[mandate.ID] = mandate
+	_ = s.repo.SeedMandate(mandate)
 }
 
 func (s *Service) AuthenticateAgent(token, sessionID string, now time.Time) (authenticatedActor, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	credentialID, ok := s.credentialsByToken[token]
-	if !ok {
+	if token == "" {
 		return authenticatedActor{}, errUnauthorized
 	}
-	credential := s.credentialsByID[credentialID]
-	if credential.RevokedAt != nil || credential.ExpiresAt.Before(now) {
-		return authenticatedActor{}, errUnauthorized
-	}
-	agent, ok := s.agents[credential.AgentID]
-	if !ok {
-		return authenticatedActor{}, errUnauthorized
-	}
-	if agent.Status == AgentStatusSuspended {
-		return authenticatedActor{}, errForbidden
-	}
-	if credential.SessionID != "" && credential.SessionID != sessionID {
-		return authenticatedActor{}, errUnauthorized
-	}
-	if agent.SessionBinding != "" && agent.SessionBinding != sessionID {
-		return authenticatedActor{}, errUnauthorized
-	}
-
-	credential.LastUsedAt = ptrTime(now)
-	s.credentialsByID[credential.ID] = credential
-	return authenticatedActor{
-		Actor:   "agent:" + agent.ID,
-		AgentID: agent.ID,
-	}, nil
+	return s.repo.AuthenticateAgent(s.hashString(token), sessionID, now)
 }
 
-func (s *Service) AuthenticateAdmin(token string) (authenticatedActor, error) {
-	if token == "" || token != s.cfg.AdminToken {
+func (s *Service) AuthenticateAdmin(token, scope string) (authenticatedActor, error) {
+	if token == "" {
+		return authenticatedActor{}, errUnauthorized
+	}
+	allowed := s.cfg.AdminWriteToken
+	if scope == "approval" && s.cfg.ApprovalToken != "" {
+		allowed = s.cfg.ApprovalToken
+	}
+	if scope == "killswitch" && s.cfg.KillSwitchToken != "" {
+		allowed = s.cfg.KillSwitchToken
+	}
+	if scope == "read" && s.cfg.AdminReadToken != "" {
+		allowed = s.cfg.AdminReadToken
+	}
+	if allowed == "" || token != allowed {
 		return authenticatedActor{}, errUnauthorized
 	}
 	return authenticatedActor{Actor: "admin", Admin: true}, nil
 }
 
-func (s *Service) ProcessIntent(intent FinancialIntent, actor authenticatedActor, now time.Time) (DecisionEnvelope, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	intentID := intent.IntentID
-	if intentID == "" {
-		intentID = s.newID("intent")
-		intent.IntentID = intentID
+func (s *Service) ProcessIntent(req SubmitIntentRequest, actor authenticatedActor, now time.Time) (DecisionEnvelope, error) {
+	intent := req.Intent
+	if intent.IntentID == "" {
+		intent.IntentID = s.newID("intent")
 	}
-	s.audit(now, intentID, intent.AgentID, intent.MandateID, "received", "", actor.Actor)
-
-	if s.killSwitch {
-		return s.rejectIntent(intent, now, actor.Actor, DecisionBlocked, "KILLSWITCH_ACTIVE"), nil
+	if err := s.validateRequest(intent, req.Execution); err != nil {
+		return s.rejectIntent(req, now, actor.Actor, DecisionDenied, err.Error())
 	}
-
-	if intent.ActorType != "agent" || intent.ActorID == "" || intent.ActorID != actor.AgentID || intent.AgentID != actor.AgentID {
-		return s.rejectIntent(intent, now, actor.Actor, DecisionDenied, "ACTOR_MISMATCH"), nil
+	if intent.ActorType != ActorTypeAgent || intent.ActorID == "" || intent.ActorID != actor.AgentID || req.Execution.AgentID != actor.AgentID {
+		return s.rejectIntent(req, now, actor.Actor, DecisionDenied, "ACTOR_MISMATCH")
 	}
-	if intent.IdempotencyKey == "" || intent.CorrelationID == "" || intent.MandateID == "" || intent.CapabilityID == "" {
-		return s.rejectIntent(intent, now, actor.Actor, DecisionDenied, "MISSING_AUTHORITY_FIELDS"), nil
+	if intent.MandateID == "" || req.Execution.CapabilityID == "" {
+		return s.rejectIntent(req, now, actor.Actor, DecisionDenied, "MISSING_AUTHORITY_FIELDS")
 	}
-	if intent.PolicyBinding.Version == "" || intent.PolicyBinding.Hash == "" {
-		return s.rejectIntent(intent, now, actor.Actor, DecisionDenied, "MISSING_POLICY_BINDING"), nil
+	if now.After(intent.ExpiresAt) {
+		return s.rejectIntent(req, now, actor.Actor, DecisionDenied, "INTENT_EXPIRED")
 	}
-	if intent.Nonce == "" || intent.Action == "" || intent.Asset == "" || intent.Contract == "" || intent.Function == "" || intent.Amount <= 0 {
-		return s.rejectIntent(intent, now, actor.Actor, DecisionDenied, "MALFORMED_INTENT"), nil
-	}
-	if intent.ExpiresAt.IsZero() || now.After(intent.ExpiresAt) {
-		return s.rejectIntent(intent, now, actor.Actor, DecisionDenied, "INTENT_EXPIRED"), nil
+	if active, err := s.repo.KillSwitchActive(); err != nil {
+		return DecisionEnvelope{}, err
+	} else if active {
+		return s.rejectIntent(req, now, actor.Actor, DecisionBlocked, "KILLSWITCH_ACTIVE")
 	}
 
-	agent, ok := s.agents[intent.AgentID]
+	agent, ok, err := s.repo.GetAgent(req.Execution.AgentID)
+	if err != nil {
+		return DecisionEnvelope{}, err
+	}
 	if !ok {
-		return s.rejectIntent(intent, now, actor.Actor, DecisionDenied, "UNKNOWN_AGENT"), nil
+		return s.rejectIntent(req, now, actor.Actor, DecisionDenied, "UNKNOWN_AGENT")
 	}
 	if agent.Status == AgentStatusSuspended {
-		return s.rejectIntent(intent, now, actor.Actor, DecisionBlocked, "AGENT_SUSPENDED"), nil
+		return s.rejectIntent(req, now, actor.Actor, DecisionBlocked, "AGENT_SUSPENDED")
 	}
-	s.audit(now, intentID, intent.AgentID, intent.MandateID, "authenticated", "", actor.Actor)
-
-	mandate, ok := s.mandates[intent.MandateID]
-	if !ok || mandate.AgentID != intent.AgentID || mandate.Status != RecordStatusActive || now.After(mandate.ExpiresAt) || mandate.RevokedAt != nil {
-		return s.rejectIntent(intent, now, actor.Actor, DecisionDenied, "MANDATE_REVOKED_OR_EXPIRED"), nil
+	mandate, ok, err := s.repo.GetMandate(intent.MandateID)
+	if err != nil {
+		return DecisionEnvelope{}, err
 	}
-	s.audit(now, intentID, intent.AgentID, intent.MandateID, "mandate_checked", "", actor.Actor)
-
-	capability, ok := s.capabilities[intent.CapabilityID]
-	if !ok || capability.AgentID != intent.AgentID || capability.Status != RecordStatusActive || (capability.ExpiresAt != nil && now.After(*capability.ExpiresAt)) || capability.RevokedAt != nil {
-		return s.rejectIntent(intent, now, actor.Actor, DecisionDenied, "CAPABILITY_REVOKED_OR_EXPIRED"), nil
+	if !ok || mandate.AgentID != req.Execution.AgentID || mandate.Status != RecordStatusActive || now.After(mandate.ExpiresAt) || mandate.RevokedAt != nil {
+		return s.rejectIntent(req, now, actor.Actor, DecisionDenied, "MANDATE_REVOKED_OR_EXPIRED")
 	}
-	if mapActionToService(intent.Action) == "blocked" {
-		return s.rejectIntent(intent, now, actor.Actor, DecisionDenied, "UNSUPPORTED_ACTION"), nil
+	capability, ok, err := s.repo.GetCapability(req.Execution.CapabilityID)
+	if err != nil {
+		return DecisionEnvelope{}, err
 	}
-	if !s.capabilityPermits(capability, intent) {
-		return s.rejectIntent(intent, now, actor.Actor, DecisionDenied, "UNSUPPORTED_ACTION"), nil
+	if !ok || capability.AgentID != req.Execution.AgentID || capability.Status != RecordStatusActive || (capability.ExpiresAt != nil && now.After(*capability.ExpiresAt)) || capability.RevokedAt != nil {
+		return s.rejectIntent(req, now, actor.Actor, DecisionDenied, "CAPABILITY_REVOKED_OR_EXPIRED")
 	}
-	if !s.autonomyAllowed(intent.AutonomyLevel, capability.AutonomyLevel, mandate.AutonomyLevel, agent.AutonomyLevel) {
-		return s.rejectIntent(intent, now, actor.Actor, DecisionDenied, "AUTONOMY_VIOLATION"), nil
+	if _, ok := routeDownstream(intent.Action); !ok {
+		return s.rejectIntent(req, now, actor.Actor, DecisionDenied, "UNSUPPORTED_ACTION")
 	}
-	s.audit(now, intentID, intent.AgentID, intent.MandateID, "capability_checked", "", actor.Actor)
-
-	requestHash := s.requestHash(intent)
-
-	policyRef := intent.PolicyBinding.DecisionRef
-	if policyRef == "" {
-		policyRef = "policy:" + s.hashString(intent.PolicyBinding.Version + ":" + intent.PolicyBinding.Hash)[:12]
-		intent.PolicyBinding.DecisionRef = policyRef
+	if reason := capabilityCompatibilityReason(capability, req); reason != "" {
+		return s.rejectIntent(req, now, actor.Actor, DecisionDenied, reason)
 	}
-	s.audit(now, intentID, intent.AgentID, intent.MandateID, "policy_checked", "", actor.Actor)
-
-	if intent.RiskLinkage.Reference == "" {
-		intent.RiskLinkage.Reference = "risk:" + s.hashString(intentID + ":" + intent.CorrelationID)[:12]
+	if !s.autonomyAllowed(req.Execution.AutonomyLevel, capability.AutonomyLevel, mandate.AutonomyLevel, agent.AutonomyLevel) {
+		return s.rejectIntent(req, now, actor.Actor, DecisionDenied, "AUTONOMY_VIOLATION")
 	}
-	if intent.RiskLinkage.DecisionRef == "" {
-		intent.RiskLinkage.DecisionRef = intent.RiskLinkage.Reference
+	authority, err := s.resolver.Resolve(intent, req.Authority)
+	if err != nil {
+		return s.rejectIntent(req, now, actor.Actor, DecisionDenied, "POLICY_RISK_UNVERIFIED")
 	}
-	s.audit(now, intentID, intent.AgentID, intent.MandateID, "risk_checked", "", actor.Actor)
-
-	idempotencyKey := intent.AgentID + ":" + intent.IdempotencyKey
-	if existingID, ok := s.idempotency[idempotencyKey]; ok {
-		existing := s.intents[existingID]
+	requestHash := s.requestHash(intent, req.Execution)
+	if existing, ok, err := s.repo.FindActionByIdempotency(req.Execution.AgentID, intent.IdempotencyKey); err != nil {
+		return DecisionEnvelope{}, err
+	} else if ok {
 		if existing.RequestHash != requestHash {
-			return s.rejectIntent(intent, now, actor.Actor, DecisionBlocked, "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD"), nil
+			return s.rejectIntent(req, now, actor.Actor, DecisionBlocked, "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD")
 		}
-		return s.rejectIntent(intent, now, actor.Actor, DecisionBlocked, "DUPLICATE_IDEMPOTENCY_KEY"), nil
+		return s.rejectIntent(req, now, actor.Actor, DecisionBlocked, "DUPLICATE_IDEMPOTENCY_KEY")
 	}
-	if issued, ok := s.nonces[intent.AgentID+":"+intent.Nonce]; ok && now.Sub(issued) <= s.cfg.ReplayWindow {
-		return s.rejectIntent(intent, now, actor.Actor, DecisionBlocked, "NONCE_REPLAYED"), nil
+	replayBucket := bucketFor(now, s.cfg.ReplayWindow)
+	if existing, ok, err := s.repo.FindActionByReplay(req.Execution.AgentID, req.Execution.Nonce, replayBucket); err != nil {
+		return DecisionEnvelope{}, err
+	} else if ok && now.Sub(existing.CreatedAt) <= s.cfg.ReplayWindow {
+		return s.rejectIntent(req, now, actor.Actor, DecisionBlocked, "REPLAY_DETECTED")
 	}
-	if now.Sub(intent.IssuedAt) > s.cfg.ReplayWindow {
-		return s.rejectIntent(intent, now, actor.Actor, DecisionBlocked, "STALE_NONCE"), nil
+	if recent, err := s.repo.CountRecentActions(req.Execution.AgentID, now.Add(-s.cfg.RateLimitWindow)); err != nil {
+		return DecisionEnvelope{}, err
+	} else if agent.RateLimit > 0 && recent >= agent.RateLimit {
+		return s.rejectIntent(req, now, actor.Actor, DecisionBlocked, "RATE_LIMIT_EXCEEDED")
 	}
-
-	if s.rateLimitExceeded(intent.AgentID, now, agent.RateLimit) {
-		return s.rejectIntent(intent, now, actor.Actor, DecisionBlocked, "RATE_LIMIT_EXCEEDED"), nil
-	}
-	if s.spendLimitExceeded(intent.AgentID, now, agent.SpendLimit, intent.Amount) {
-		return s.rejectIntent(intent, now, actor.Actor, DecisionBlocked, "SPEND_LIMIT_EXCEEDED"), nil
-	}
-
-	status := DecisionApproved
-	reason := ""
-	if intent.ReviewRequested || intent.Amount > agent.ReviewLimit {
-		status = DecisionReview
-		reason = "APPROVAL_REQUIRED"
-	}
-	if intent.RiskLinkage.Score >= 0.95 {
-		status = DecisionQuarantine
-		reason = "RISK_QUARANTINED"
-	} else if intent.RiskLinkage.Score >= 0.85 {
-		status = DecisionChallenge
-		reason = "RISK_CHALLENGED"
-	} else if intent.RiskLinkage.Score >= 0.70 {
-		status = DecisionDelay
-		reason = "RISK_DELAYED"
+	if amountValue(intent.Amount) > 0 {
+		if spent, err := s.repo.SumRecentApprovedSpend(req.Execution.AgentID, now.Add(-s.cfg.RateLimitWindow)); err != nil {
+			return DecisionEnvelope{}, err
+		} else if agent.SpendLimit > 0 && spent+amountValue(intent.Amount) > agent.SpendLimit {
+			return s.rejectIntent(req, now, actor.Actor, DecisionBlocked, "SPEND_LIMIT_EXCEEDED")
+		}
 	}
 
+	status, reason := decisionFromOutcome(authority.Outcome)
 	record := IntentRecord{
-		FinancialIntent: intent,
-		Status:          status,
-		ReasonCode:      reason,
-		CreatedAt:       now,
-		UpdatedAt:       now,
-		RequestHash:     requestHash,
+		Intent:              intent,
+		Execution:           req.Execution,
+		Authority:           authority,
+		Status:              status,
+		PolicyOutcome:       authority.Outcome,
+		ReasonCode:          reason,
+		Forwarded:           status == DecisionApproved,
+		CreatedAt:           now.UTC(),
+		UpdatedAt:           now.UTC(),
+		RequestHash:         requestHash,
+		Metadata:            req.Metadata,
+		DeprecationWarnings: req.DeprecationWarnings,
 	}
-	s.idempotency[idempotencyKey] = intentID
-	s.nonces[intent.AgentID+":"+intent.Nonce] = now
-	s.agentRequests[intent.AgentID] = append(s.agentRequests[intent.AgentID], now)
-
-	if status == DecisionApproved {
-		record.Forwarded = true
+	if record.Forwarded {
 		record.DownstreamReference = s.forward(intent)
-		s.agentSpend[intent.AgentID] = append(s.agentSpend[intent.AgentID], spendEntry{At: now, Amount: intent.Amount})
-		s.audit(now, intentID, intent.AgentID, intent.MandateID, "approved", "", actor.Actor)
-		s.audit(now, intentID, intent.AgentID, intent.MandateID, "forwarded", "", actor.Actor)
-	} else {
-		s.audit(now, intentID, intent.AgentID, intent.MandateID, strings.ToLower(string(status)), reason, actor.Actor)
 	}
-
-	s.intents[intentID] = record
+	if err := s.repo.SaveIntent(record); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return s.rejectIntent(req, now, actor.Actor, DecisionBlocked, "REPLAY_DETECTED")
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			if _, ok, lookupErr := s.repo.FindActionByIdempotency(req.Execution.AgentID, intent.IdempotencyKey); lookupErr == nil && ok {
+				return s.rejectIntent(req, now, actor.Actor, DecisionBlocked, "DUPLICATE_IDEMPOTENCY_KEY")
+			}
+			return s.rejectIntent(req, now, actor.Actor, DecisionBlocked, "REPLAY_DETECTED")
+		}
+		return DecisionEnvelope{}, err
+	}
+	if err := s.repo.RecordAuthorization(intent.IntentID, authority, intent.PolicyVersion, now); err != nil {
+		return DecisionEnvelope{}, err
+	}
+	if err := s.audit(record, actor.Actor, now, strings.ToLower(string(status)), reason); err != nil {
+		return DecisionEnvelope{}, err
+	}
+	if record.Forwarded {
+		if err := s.audit(record, actor.Actor, now, "forwarded", ""); err != nil {
+			return DecisionEnvelope{}, err
+		}
+	}
 	return envelope(record), nil
 }
 
 func (s *Service) ApproveIntent(intentID string, actor authenticatedActor, now time.Time) (DecisionEnvelope, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	record, ok := s.intents[intentID]
+	record, ok, err := s.repo.GetIntent(intentID)
+	if err != nil {
+		return DecisionEnvelope{}, err
+	}
 	if !ok {
 		return DecisionEnvelope{}, errors.New("intent not found")
 	}
@@ -295,200 +279,170 @@ func (s *Service) ApproveIntent(intentID string, actor authenticatedActor, now t
 	record.Status = DecisionApproved
 	record.ReasonCode = ""
 	record.Forwarded = true
-	record.ApprovedAt = ptrTime(now)
-	record.UpdatedAt = now
-	record.DownstreamReference = s.forward(record.FinancialIntent)
-	s.agentSpend[record.AgentID] = append(s.agentSpend[record.AgentID], spendEntry{At: now, Amount: record.Amount})
-	s.intents[intentID] = record
-	s.audit(now, intentID, record.AgentID, record.MandateID, "approved", "", actor.Actor)
-	s.audit(now, intentID, record.AgentID, record.MandateID, "forwarded", "", actor.Actor)
+	record.ApprovedAt = ptrTime(now.UTC())
+	record.UpdatedAt = now.UTC()
+	record.DownstreamReference = s.forward(record.Intent)
+	if err := s.repo.UpdateIntent(record); err != nil {
+		return DecisionEnvelope{}, err
+	}
+	if err := s.audit(record, actor.Actor, now, "approved", ""); err != nil {
+		return DecisionEnvelope{}, err
+	}
+	if err := s.audit(record, actor.Actor, now, "forwarded", ""); err != nil {
+		return DecisionEnvelope{}, err
+	}
 	return envelope(record), nil
 }
 
 func (s *Service) CancelIntent(intentID string, actor authenticatedActor, now time.Time) (DecisionEnvelope, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	record, ok := s.intents[intentID]
+	record, ok, err := s.repo.GetIntent(intentID)
+	if err != nil {
+		return DecisionEnvelope{}, err
+	}
 	if !ok {
 		return DecisionEnvelope{}, errors.New("intent not found")
 	}
 	record.Status = DecisionCancelled
 	record.ReasonCode = "CANCELLED"
-	record.UpdatedAt = now
-	record.CancelledAt = ptrTime(now)
-	s.intents[intentID] = record
-	s.audit(now, intentID, record.AgentID, record.MandateID, "cancelled", "CANCELLED", actor.Actor)
+	record.UpdatedAt = now.UTC()
+	record.CancelledAt = ptrTime(now.UTC())
+	if err := s.repo.UpdateIntent(record); err != nil {
+		return DecisionEnvelope{}, err
+	}
+	if err := s.audit(record, actor.Actor, now, "cancelled", "CANCELLED"); err != nil {
+		return DecisionEnvelope{}, err
+	}
 	return envelope(record), nil
 }
 
 func (s *Service) GetIntent(intentID string) (IntentRecord, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	record, ok := s.intents[intentID]
+	record, ok, err := s.repo.GetIntent(intentID)
+	if err != nil {
+		return IntentRecord{}, false
+	}
 	return record, ok
 }
 
 func (s *Service) GetAgentStatus(agentID string) (Agent, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	agent, ok := s.agents[agentID]
+	agent, ok, err := s.repo.GetAgent(agentID)
+	if err != nil {
+		return Agent{}, false
+	}
 	return agent, ok
 }
 
 func (s *Service) SuspendAgent(agentID string, actor authenticatedActor, now time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	agent, ok := s.agents[agentID]
-	if !ok {
-		return errors.New("agent not found")
+	if err := s.repo.SuspendAgent(agentID, now.UTC()); err != nil {
+		return err
 	}
-	agent.Status = AgentStatusSuspended
-	agent.SuspendedAt = ptrTime(now)
-	s.agents[agentID] = agent
-	s.preventionSignals = append(s.preventionSignals, "agent:"+agentID)
-	s.audit(now, "", agentID, "", "suspended", "DOWNSTREAM_PREVENTION_SIGNALLED", actor.Actor)
-	return nil
+	return s.repo.AppendAudit(AuditEvent{
+		EventID:   s.newID("evt"),
+		Timestamp: now.UTC(),
+		AgentID:   agentID,
+		Decision:  "suspended",
+		ReasonCode:"DOWNSTREAM_PREVENTION_SIGNALLED",
+		Actor:     actor.Actor,
+	}, map[string]interface{}{"signal": "agent:" + agentID})
 }
 
 func (s *Service) RevokeAgentCredentials(agentID string, actor authenticatedActor, now time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for id, credential := range s.credentialsByID {
-		if credential.AgentID != agentID {
-			continue
-		}
-		credential.RevokedAt = ptrTime(now)
-		s.credentialsByID[id] = credential
+	if err := s.repo.RevokeAgentCredentials(agentID, now.UTC()); err != nil {
+		return err
 	}
-	s.audit(now, "", agentID, "", "revoked", "CREDENTIALS_REVOKED", actor.Actor)
-	return nil
+	return s.repo.AppendAudit(AuditEvent{
+		EventID:    s.newID("evt"),
+		Timestamp:  now.UTC(),
+		AgentID:    agentID,
+		Decision:   "revoked",
+		ReasonCode: "CREDENTIALS_REVOKED",
+		Actor:      actor.Actor,
+	}, nil)
 }
 
 func (s *Service) RevokeCapability(capabilityID string, actor authenticatedActor, now time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	capability, ok := s.capabilities[capabilityID]
+	capability, ok, err := s.repo.GetCapability(capabilityID)
+	if err != nil {
+		return err
+	}
 	if !ok {
 		return errors.New("capability not found")
 	}
-	capability.Status = RecordStatusRevoked
-	capability.RevokedAt = ptrTime(now)
-	s.capabilities[capabilityID] = capability
-	s.audit(now, "", capability.AgentID, "", "revoked", "CAPABILITY_REVOKED", actor.Actor)
-	return nil
+	if err := s.repo.RevokeCapability(capabilityID, now.UTC()); err != nil {
+		return err
+	}
+	return s.repo.AppendAudit(AuditEvent{
+		EventID:    s.newID("evt"),
+		Timestamp:  now.UTC(),
+		AgentID:    capability.AgentID,
+		Decision:   "revoked",
+		ReasonCode: "CAPABILITY_REVOKED",
+		Actor:      actor.Actor,
+	}, nil)
 }
 
-func (s *Service) ActivateKillSwitch(actor authenticatedActor, now time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.killSwitch = true
-	s.preventionSignals = append(s.preventionSignals, "global")
-	s.audit(now, "", "", "", "killswitch_activated", "DOWNSTREAM_PREVENTION_SIGNALLED", actor.Actor)
+func (s *Service) ActivateKillSwitch(actor authenticatedActor, now time.Time) error {
+	return s.repo.AppendAudit(AuditEvent{
+		EventID:    s.newID("evt"),
+		Timestamp:  now.UTC(),
+		Decision:   "killswitch_activated",
+		ReasonCode: "DOWNSTREAM_PREVENTION_SIGNALLED",
+		Actor:      actor.Actor,
+	}, map[string]interface{}{"signal": "global"})
 }
 
-func (s *Service) DeactivateKillSwitch(actor authenticatedActor, now time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.killSwitch = false
-	s.audit(now, "", "", "", "killswitch_deactivated", "", actor.Actor)
+func (s *Service) DeactivateKillSwitch(actor authenticatedActor, now time.Time) error {
+	return s.repo.AppendAudit(AuditEvent{
+		EventID:   s.newID("evt"),
+		Timestamp: now.UTC(),
+		Decision:  "killswitch_deactivated",
+		Actor:     actor.Actor,
+	}, nil)
 }
 
 func (s *Service) AuditEvents(intentID string) []AuditEvent {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]AuditEvent, 0)
-	for _, event := range s.auditEvents {
-		if intentID == "" || event.IntentID == intentID {
-			out = append(out, event)
-		}
+	events, err := s.repo.ListAuditEvents(intentID)
+	if err != nil {
+		return nil
 	}
-	return out
-}
-
-func (s *Service) PreventionSignals() []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return append([]string(nil), s.preventionSignals...)
+	return events
 }
 
 func (s *Service) VerifyAuditIntegrity() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	prev := ""
-	for _, event := range s.auditEvents {
-		if event.PrevHash != prev {
-			return false
-		}
-		if event.Hash != s.auditHash(event.EventID, event.Timestamp, event.IntentID, event.AgentID, event.MandateID, event.Decision, event.ReasonCode, event.Actor, event.PrevHash) {
-			return false
-		}
-		prev = event.Hash
-	}
-	return true
+	ok, err := s.repo.VerifyAuditIntegrity()
+	return err == nil && ok
 }
 
-func (s *Service) rejectIntent(intent FinancialIntent, now time.Time, actor string, decision Decision, reason string) DecisionEnvelope {
+func (s *Service) validateRequest(intent FinancialIntent, execution ExecutionHints) error {
+	switch {
+	case !isValidActorType(intent.ActorType):
+		return errors.New("MALFORMED_INTENT")
+	case !isValidAction(intent.Action):
+		return errors.New("MALFORMED_INTENT")
+	case intent.ActorID == "", intent.AssetID == "", intent.Purpose == "", intent.PolicyVersion == "", intent.CorrelationID == "", intent.IdempotencyKey == "", intent.ExpiresAt.IsZero(), execution.AgentID == "", execution.CapabilityID == "", execution.Nonce == "":
+		return errors.New("MISSING_AUTHORITY_FIELDS")
+	case intent.Amount != nil && *intent.Amount <= 0:
+		return errors.New("MALFORMED_INTENT")
+	}
+	return nil
+}
+
+func (s *Service) rejectIntent(req SubmitIntentRequest, now time.Time, actor string, decision Decision, reason string) (DecisionEnvelope, error) {
 	record := IntentRecord{
-		FinancialIntent: intent,
-		Status:          decision,
-		ReasonCode:      reason,
-		CreatedAt:       now,
-		UpdatedAt:       now,
-		RequestHash:     s.intentHash(intent),
+		Intent:              req.Intent,
+		Execution:           req.Execution,
+		Authority:           req.Authority,
+		Status:              decision,
+		ReasonCode:          reason,
+		CreatedAt:           now.UTC(),
+		UpdatedAt:           now.UTC(),
+		RequestHash:         s.requestHash(req.Intent, req.Execution),
+		Metadata:            req.Metadata,
+		DeprecationWarnings: req.DeprecationWarnings,
 	}
-	s.intents[intent.IntentID] = record
-	stage := strings.ToLower(string(decision))
-	if decision == DecisionDenied {
-		stage = "denied"
+	if err := s.repo.SaveIntent(record); err == nil {
+		_ = s.audit(record, actor, now, strings.ToLower(string(decision)), reason)
 	}
-	s.audit(now, intent.IntentID, intent.AgentID, intent.MandateID, stage, reason, actor)
-	return envelope(record)
-}
-
-func (s *Service) rateLimitExceeded(agentID string, now time.Time, limit int) bool {
-	windowStart := now.Add(-s.cfg.RateLimitWindow)
-	timestamps := s.agentRequests[agentID][:0]
-	for _, ts := range s.agentRequests[agentID] {
-		if ts.After(windowStart) {
-			timestamps = append(timestamps, ts)
-		}
-	}
-	s.agentRequests[agentID] = timestamps
-	return limit > 0 && len(timestamps) >= limit
-}
-
-func (s *Service) spendLimitExceeded(agentID string, now time.Time, limit, requested float64) bool {
-	windowStart := now.Add(-s.cfg.RateLimitWindow)
-	entries := s.agentSpend[agentID][:0]
-	total := 0.0
-	for _, entry := range s.agentSpend[agentID] {
-		if entry.At.After(windowStart) {
-			entries = append(entries, entry)
-			total += entry.Amount
-		}
-	}
-	s.agentSpend[agentID] = entries
-	return limit > 0 && total+requested > limit
-}
-
-func (s *Service) capabilityPermits(capability AgentCapability, intent FinancialIntent) bool {
-	if !contains(capability.AllowedActions, intent.Action) {
-		return false
-	}
-	if !contains(capability.AllowedAssets, intent.Asset) {
-		return false
-	}
-	if !contains(capability.AllowedChains, intent.Chain) {
-		return false
-	}
-	if !contains(capability.AllowedContracts, intent.Contract) {
-		return false
-	}
-	if !contains(capability.AllowedFunctions, intent.Function) {
-		return false
-	}
-	return true
+	return envelope(record), nil
 }
 
 func (s *Service) autonomyAllowed(levels ...AutonomyLevel) bool {
@@ -505,52 +459,46 @@ func (s *Service) autonomyAllowed(levels ...AutonomyLevel) bool {
 }
 
 func (s *Service) forward(intent FinancialIntent) string {
-	return mapActionToService(intent.Action) + ":" + s.hashString(intent.IntentID + intent.CorrelationID)[:12]
+	downstream, _ := routeDownstream(intent.Action)
+	return downstream + ":" + s.hashString(intent.IntentID+intent.CorrelationID)[:12]
 }
 
-func (s *Service) audit(now time.Time, intentID, agentID, mandateID, decision, reasonCode, actor string) {
-	eventID := s.newID("evt")
-	hash := s.auditHash(eventID, now, intentID, agentID, mandateID, decision, reasonCode, actor, s.lastAuditHash)
-	event := AuditEvent{
-		EventID:    eventID,
-		Timestamp:  now.UTC(),
-		IntentID:   intentID,
-		AgentID:    agentID,
-		MandateID:  mandateID,
-		Decision:   decision,
-		ReasonCode: reasonCode,
-		Actor:      actor,
-		Hash:       hash,
-		PrevHash:   s.lastAuditHash,
+func (s *Service) audit(record IntentRecord, actor string, now time.Time, decision, reason string) error {
+	payload := map[string]interface{}{
+		"intent":    record.Intent,
+		"execution": record.Execution,
+		"authority": record.Authority,
+		"status":    record.Status,
 	}
-	s.auditEvents = append(s.auditEvents, event)
-	s.lastAuditHash = hash
+	return s.repo.AppendAudit(AuditEvent{
+		EventID:          s.newID("evt"),
+		Timestamp:        now.UTC(),
+		IntentID:         record.Intent.IntentID,
+		ActorID:          record.Intent.ActorID,
+		AgentID:          record.Execution.AgentID,
+		MandateID:        record.Intent.MandateID,
+		PolicyVersion:    record.Intent.PolicyVersion,
+		RiskAssessmentID: record.Authority.RiskAssessmentID,
+		AuthorizationID:  record.Authority.AuthorizationID,
+		CorrelationID:    record.Intent.CorrelationID,
+		Decision:         decision,
+		ReasonCode:       reason,
+		Actor:            actor,
+	}, payload)
 }
 
 func (s *Service) newID(prefix string) string {
-	s.nextID++
-	return fmt.Sprintf("%s-%06d", prefix, s.nextID)
+	return fmt.Sprintf("%s-%06d", prefix, s.sequence.Add(1))
 }
 
-func (s *Service) auditHash(eventID string, ts time.Time, intentID, agentID, mandateID, decision, reasonCode, actor, prevHash string) string {
-	parts := strings.Join([]string{eventID, ts.UTC().Format(time.RFC3339Nano), intentID, agentID, mandateID, decision, reasonCode, actor, prevHash}, "|")
-	return s.hashString(parts)
-}
-
-func (s *Service) intentHash(intent FinancialIntent) string {
-	type alias FinancialIntent
-	b, _ := json.Marshal(alias(intent))
-	return s.hashString(string(b))
-}
-
-func (s *Service) requestHash(intent FinancialIntent) string {
+func (s *Service) requestHash(intent FinancialIntent, execution ExecutionHints) string {
 	intent.IntentID = ""
-	intent.IssuedAt = time.Time{}
 	intent.ExpiresAt = time.Time{}
-	intent.PolicyBinding.DecisionRef = ""
-	intent.RiskLinkage.Reference = ""
-	intent.RiskLinkage.DecisionRef = ""
-	return s.intentHash(intent)
+	b, _ := json.Marshal(struct {
+		Intent    FinancialIntent `json:"intent"`
+		Execution ExecutionHints  `json:"execution"`
+	}{Intent: intent, Execution: execution})
+	return s.hashString(string(b))
 }
 
 func (s *Service) hashString(value string) string {
@@ -560,15 +508,99 @@ func (s *Service) hashString(value string) string {
 
 func envelope(record IntentRecord) DecisionEnvelope {
 	return DecisionEnvelope{
-		IntentID:            record.IntentID,
+		ContractVersion:     ContractVersion,
+		SchemaVersion:       SchemaVersion,
+		Intent:              record.Intent,
+		Execution:           record.Execution,
+		Authority:           record.Authority,
 		Decision:            record.Status,
 		Status:              record.Status,
+		PolicyOutcome:       record.PolicyOutcome,
 		ReasonCode:          record.ReasonCode,
 		Forwarded:           record.Forwarded,
 		ApprovalRequired:    record.Status == DecisionReview || record.Status == DecisionChallenge || record.Status == DecisionDelay,
 		DownstreamReference: record.DownstreamReference,
-		PolicyDecisionRef:   record.PolicyBinding.DecisionRef,
-		RiskReference:       record.RiskLinkage.Reference,
+		DeprecationWarnings: record.DeprecationWarnings,
+	}
+}
+
+func completeAuthority(authority AuthorityReferences) bool {
+	return authority.PolicyDecisionID != "" && authority.RiskAssessmentID != "" && authority.AuthorizationID != "" && authority.Outcome != ""
+}
+
+func decisionFromOutcome(outcome PolicyOutcome) (Decision, string) {
+	switch outcome {
+	case PolicyOutcomeAllow:
+		return DecisionApproved, ""
+	case PolicyOutcomeDeny:
+		return DecisionDenied, "POLICY_DENIED"
+	case PolicyOutcomeReview:
+		return DecisionReview, "APPROVAL_REQUIRED"
+	case PolicyOutcomeChallenge:
+		return DecisionChallenge, "POLICY_CHALLENGE"
+	case PolicyOutcomeDelay:
+		return DecisionDelay, "POLICY_DELAY"
+	case PolicyOutcomeQuarantine:
+		return DecisionQuarantine, "POLICY_QUARANTINED"
+	default:
+		return DecisionDenied, "POLICY_RISK_UNVERIFIED"
+	}
+}
+
+func routeDownstream(action FinancialAction) (string, bool) {
+	switch action {
+	case ActionPay, ActionTransfer, ActionCollect:
+		return "pay", true
+	case ActionSwap, ActionTrade, ActionRebalance, ActionOpenPosition, ActionClosePosition:
+		return "markets", true
+	default:
+		return "", false
+	}
+}
+
+func capabilityCompatibilityReason(capability AgentCapability, req SubmitIntentRequest) string {
+	if !contains(capability.AllowedActions, string(req.Intent.Action)) {
+		return "UNSUPPORTED_ACTION"
+	}
+	if req.Intent.AssetID != "" && len(capability.AllowedAssets) > 0 && !contains(capability.AllowedAssets, req.Intent.AssetID) {
+		return "UNSUPPORTED_ASSET"
+	}
+	if req.Intent.ChainID != "" && len(capability.AllowedChains) > 0 && !contains(capability.AllowedChains, req.Intent.ChainID) {
+		return "UNSUPPORTED_CHAIN"
+	}
+	if req.Execution.ExecutionRef.Contract != "" && len(capability.AllowedContracts) > 0 && !contains(capability.AllowedContracts, req.Execution.ExecutionRef.Contract) {
+		return "UNSUPPORTED_CALL_TARGET"
+	}
+	if req.Execution.ExecutionRef.Function != "" && len(capability.AllowedFunctions) > 0 && !contains(capability.AllowedFunctions, req.Execution.ExecutionRef.Function) {
+		return "UNSUPPORTED_CALL_TARGET"
+	}
+	return ""
+}
+
+func isValidActorType(value ActorType) bool {
+	switch value {
+	case ActorTypeUser, ActorTypeApplication, ActorTypeSystem, ActorTypeAgent:
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidAction(value FinancialAction) bool {
+	switch value {
+	case ActionPay, ActionTransfer, ActionSwap, ActionTrade, ActionRebalance, ActionCollect, ActionOpenPosition, ActionClosePosition:
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidPolicyOutcome(value PolicyOutcome) bool {
+	switch value {
+	case PolicyOutcomeAllow, PolicyOutcomeDeny, PolicyOutcomeReview, PolicyOutcomeChallenge, PolicyOutcomeDelay, PolicyOutcomeQuarantine:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -581,17 +613,18 @@ func contains(values []string, target string) bool {
 	return false
 }
 
-func mapActionToService(action string) string {
-	switch strings.ToUpper(action) {
-	case "TRANSFER":
-		return "pay"
-	case "TRADE":
-		return "markets"
-	case "BALANCE_CHECK":
-		return "accounts"
-	default:
-		return "blocked"
+func bucketFor(now time.Time, window time.Duration) string {
+	if window <= 0 {
+		return now.UTC().Format(time.RFC3339)
 	}
+	return now.UTC().Truncate(window).Format(time.RFC3339)
+}
+
+func amountValue(value *float64) float64 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 func ptrTime(t time.Time) *time.Time {

@@ -2,6 +2,11 @@ package gateway
 
 import "time"
 
+const (
+	ContractVersion = "RFC-0005/0007"
+	SchemaVersion   = "v1"
+)
+
 type Decision string
 
 const (
@@ -13,6 +18,39 @@ const (
 	DecisionQuarantine Decision = "QUARANTINE"
 	DecisionCancelled  Decision = "CANCELLED"
 	DecisionBlocked    Decision = "BLOCKED"
+)
+
+type PolicyOutcome string
+
+const (
+	PolicyOutcomeAllow      PolicyOutcome = "ALLOW"
+	PolicyOutcomeDeny       PolicyOutcome = "DENY"
+	PolicyOutcomeReview     PolicyOutcome = "REVIEW"
+	PolicyOutcomeChallenge  PolicyOutcome = "CHALLENGE"
+	PolicyOutcomeDelay      PolicyOutcome = "DELAY"
+	PolicyOutcomeQuarantine PolicyOutcome = "QUARANTINE"
+)
+
+type ActorType string
+
+const (
+	ActorTypeUser        ActorType = "USER"
+	ActorTypeApplication ActorType = "APPLICATION"
+	ActorTypeSystem      ActorType = "SYSTEM"
+	ActorTypeAgent       ActorType = "AGENT"
+)
+
+type FinancialAction string
+
+const (
+	ActionPay           FinancialAction = "PAY"
+	ActionTransfer      FinancialAction = "TRANSFER"
+	ActionSwap          FinancialAction = "SWAP"
+	ActionTrade         FinancialAction = "TRADE"
+	ActionRebalance     FinancialAction = "REBALANCE"
+	ActionCollect       FinancialAction = "COLLECT"
+	ActionOpenPosition  FinancialAction = "OPEN_POSITION"
+	ActionClosePosition FinancialAction = "CLOSE_POSITION"
 )
 
 type AgentStatus string
@@ -84,9 +122,52 @@ type AgentMandate struct {
 	ID            string        `json:"mandateId"`
 	AgentID       string        `json:"agentId"`
 	AutonomyLevel AutonomyLevel `json:"autonomyLevel"`
+	PolicyVersion string        `json:"policyVersion"`
+	PolicyHash    string        `json:"policyHash,omitempty"`
 	Status        RecordStatus  `json:"status"`
 	RevokedAt     *time.Time    `json:"revokedAt,omitempty"`
 	ExpiresAt     time.Time     `json:"expiresAt"`
+}
+
+type FinancialIntent struct {
+	IntentID       string          `json:"intentId,omitempty"`
+	ActorType      ActorType       `json:"actorType"`
+	ActorID        string          `json:"actorId"`
+	Action         FinancialAction `json:"action"`
+	AssetID        string          `json:"assetId"`
+	Amount         *float64        `json:"amount,omitempty"`
+	ChainID        string          `json:"chainId,omitempty"`
+	Recipient      string          `json:"recipient,omitempty"`
+	Venue          string          `json:"venue,omitempty"`
+	Purpose        string          `json:"purpose"`
+	MandateID      string          `json:"mandateId,omitempty"`
+	PolicyVersion  string          `json:"policyVersion"`
+	CorrelationID  string          `json:"correlationId"`
+	IdempotencyKey string          `json:"idempotencyKey"`
+	ExpiresAt      time.Time       `json:"expiresAt"`
+}
+
+type ExecutionContextRef struct {
+	CallTarget string `json:"callTarget,omitempty"`
+	Contract   string `json:"contract,omitempty"`
+	Function   string `json:"function,omitempty"`
+}
+
+type ExecutionHints struct {
+	AgentID        string              `json:"agentId"`
+	CapabilityID   string              `json:"capabilityId"`
+	Nonce          string              `json:"nonce"`
+	AutonomyLevel  AutonomyLevel       `json:"autonomyLevel,omitempty"`
+	ExecutionRef   ExecutionContextRef `json:"executionRef,omitempty"`
+	DownstreamHint string              `json:"downstreamHint,omitempty"`
+}
+
+type AuthorityReferences struct {
+	PolicyDecisionID string        `json:"policyDecisionId,omitempty"`
+	RiskAssessmentID string        `json:"riskAssessmentId,omitempty"`
+	AuthorizationID  string        `json:"authorizationId,omitempty"`
+	Outcome          PolicyOutcome `json:"outcome,omitempty"`
+	LookupKey        string        `json:"lookupKey,omitempty"`
 }
 
 type PolicyBinding struct {
@@ -101,74 +182,75 @@ type RiskLinkage struct {
 	Score       float64 `json:"score,omitempty"`
 }
 
-type FinancialIntent struct {
-	IntentID        string                 `json:"intentId,omitempty"`
-	ActorType       string                 `json:"actorType"`
-	ActorID         string                 `json:"actorId"`
-	AgentID         string                 `json:"agentId"`
-	CapabilityID    string                 `json:"capabilityId"`
-	MandateID       string                 `json:"mandateId"`
-	Action          string                 `json:"action"`
-	Asset           string                 `json:"asset"`
-	Amount          float64                `json:"amount"`
-	Chain           string                 `json:"chain"`
-	Contract        string                 `json:"contract"`
-	Function        string                 `json:"function"`
-	Nonce           string                 `json:"nonce"`
-	IssuedAt        time.Time              `json:"issuedAt"`
-	ExpiresAt       time.Time              `json:"expiresAt"`
-	IdempotencyKey  string                 `json:"idempotencyKey"`
-	CorrelationID   string                 `json:"correlationId"`
-	AutonomyLevel   AutonomyLevel          `json:"autonomyLevel"`
-	PolicyBinding   PolicyBinding          `json:"policyBinding"`
-	RiskLinkage     RiskLinkage            `json:"riskLinkage"`
-	ReviewRequested bool                   `json:"reviewRequested,omitempty"`
-	Metadata        map[string]interface{} `json:"metadata,omitempty"`
+type SubmitIntentRequest struct {
+	Intent              FinancialIntent         `json:"intent"`
+	Execution           ExecutionHints          `json:"execution"`
+	Authority           AuthorityReferences     `json:"authority,omitempty"`
+	Metadata            map[string]interface{}  `json:"metadata,omitempty"`
+	DeprecationWarnings []string                `json:"deprecationWarnings,omitempty"`
 }
 
 type IntentRecord struct {
-	FinancialIntent
-	Status              Decision   `json:"status"`
-	ReasonCode          string     `json:"reasonCode,omitempty"`
-	Forwarded           bool       `json:"forwarded"`
-	CreatedAt           time.Time  `json:"createdAt"`
-	UpdatedAt           time.Time  `json:"updatedAt"`
-	RequestHash         string     `json:"requestHash"`
-	DownstreamReference string     `json:"downstreamReference,omitempty"`
-	ApprovedAt          *time.Time `json:"approvedAt,omitempty"`
-	CancelledAt         *time.Time `json:"cancelledAt,omitempty"`
+	Intent              FinancialIntent        `json:"intent"`
+	Execution           ExecutionHints         `json:"execution"`
+	Authority           AuthorityReferences    `json:"authority"`
+	Status              Decision               `json:"status"`
+	PolicyOutcome       PolicyOutcome          `json:"policyOutcome,omitempty"`
+	ReasonCode          string                 `json:"reasonCode,omitempty"`
+	Forwarded           bool                   `json:"forwarded"`
+	CreatedAt           time.Time              `json:"createdAt"`
+	UpdatedAt           time.Time              `json:"updatedAt"`
+	RequestHash         string                 `json:"requestHash"`
+	DownstreamReference string                 `json:"downstreamReference,omitempty"`
+	ApprovedAt          *time.Time             `json:"approvedAt,omitempty"`
+	CancelledAt         *time.Time             `json:"cancelledAt,omitempty"`
+	Metadata            map[string]interface{} `json:"metadata,omitempty"`
+	DeprecationWarnings []string               `json:"deprecationWarnings,omitempty"`
 }
 
 type DecisionEnvelope struct {
-	IntentID            string   `json:"intentId"`
-	Decision            Decision `json:"decision"`
-	Status              Decision `json:"status"`
-	ReasonCode          string   `json:"reasonCode,omitempty"`
-	Forwarded           bool     `json:"forwarded"`
-	ApprovalRequired    bool     `json:"approvalRequired"`
-	DownstreamReference string   `json:"downstreamReference,omitempty"`
-	PolicyDecisionRef   string   `json:"policyDecisionRef,omitempty"`
-	RiskReference       string   `json:"riskReference,omitempty"`
+	ContractVersion     string              `json:"contractVersion"`
+	SchemaVersion       string              `json:"schemaVersion"`
+	Intent              FinancialIntent     `json:"intent"`
+	Execution           ExecutionHints      `json:"execution"`
+	Authority           AuthorityReferences `json:"authority"`
+	Decision            Decision            `json:"decision"`
+	Status              Decision            `json:"status"`
+	PolicyOutcome       PolicyOutcome       `json:"policyOutcome,omitempty"`
+	ReasonCode          string              `json:"reasonCode,omitempty"`
+	Forwarded           bool                `json:"forwarded"`
+	ApprovalRequired    bool                `json:"approvalRequired"`
+	DownstreamReference string              `json:"downstreamReference,omitempty"`
+	DeprecationWarnings []string            `json:"deprecationWarnings,omitempty"`
 }
 
 type AuditEvent struct {
-	EventID    string    `json:"eventId"`
-	Timestamp  time.Time `json:"timestamp"`
-	IntentID   string    `json:"intentId,omitempty"`
-	AgentID    string    `json:"agentId,omitempty"`
-	MandateID  string    `json:"mandateId,omitempty"`
-	Decision   string    `json:"decision"`
-	ReasonCode string    `json:"reasonCode,omitempty"`
-	Actor      string    `json:"actor"`
-	Hash       string    `json:"hash"`
-	PrevHash   string    `json:"prevHash,omitempty"`
+	EventID           string    `json:"eventId"`
+	Timestamp         time.Time `json:"timestamp"`
+	IntentID          string    `json:"intentId,omitempty"`
+	ActorID           string    `json:"actorId,omitempty"`
+	AgentID           string    `json:"agentId,omitempty"`
+	MandateID         string    `json:"mandateId,omitempty"`
+	PolicyVersion     string    `json:"policyVersion,omitempty"`
+	RiskAssessmentID  string    `json:"riskAssessmentId,omitempty"`
+	AuthorizationID   string    `json:"authorizationId,omitempty"`
+	CorrelationID     string    `json:"correlationId,omitempty"`
+	Decision          string    `json:"decision"`
+	ReasonCode        string    `json:"reasonCode,omitempty"`
+	Actor             string    `json:"actor"`
+	Hash              string    `json:"hash"`
+	PrevHash          string    `json:"prevHash,omitempty"`
 }
 
 type Config struct {
-	AdminToken         string
-	ReplayWindow       time.Duration
-	RateLimitWindow    time.Duration
-	DefaultRateLimit   int
-	DefaultSpendLimit  float64
+	AdminReadToken    string
+	AdminWriteToken   string
+	KillSwitchToken   string
+	ApprovalToken     string
+	DatabaseURL       string
+	ReplayWindow      time.Duration
+	RateLimitWindow   time.Duration
+	DefaultRateLimit  int
+	DefaultSpendLimit float64
 	DefaultReviewLimit float64
 }
