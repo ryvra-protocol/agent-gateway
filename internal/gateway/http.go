@@ -259,36 +259,36 @@ func decodeSubmitIntentRequest(body io.Reader) (SubmitIntentRequest, error) {
 		return SubmitIntentRequest{}, fmt.Errorf("request body is required")
 	}
 	var raw struct {
-		Intent         *FinancialIntent        `json:"intent"`
-		Execution      *ExecutionHints         `json:"execution"`
-		Authority      *AuthorityReferences    `json:"authority"`
-		Metadata       map[string]interface{}  `json:"metadata"`
-		IntentID       string                  `json:"intentId"`
-		ActorType      ActorType               `json:"actorType"`
-		ActorID        string                  `json:"actorId"`
-		Action         FinancialAction         `json:"action"`
-		AssetID        string                  `json:"assetId"`
-		Amount         *float64                `json:"amount"`
-		ChainID        string                  `json:"chainId"`
-		Recipient      string                  `json:"recipient"`
-		Venue          string                  `json:"venue"`
-		Purpose        string                  `json:"purpose"`
-		MandateID      string                  `json:"mandateId"`
-		PolicyVersion  string                  `json:"policyVersion"`
-		CorrelationID  string                  `json:"correlationId"`
-		IdempotencyKey string                  `json:"idempotencyKey"`
-		ExpiresAt      time.Time               `json:"expiresAt"`
-		AgentID        string                  `json:"agentId"`
-		CapabilityID   string                  `json:"capabilityId"`
-		Nonce          string                  `json:"nonce"`
-		AutonomyLevel  AutonomyLevel           `json:"autonomyLevel"`
-		ExecutionRef   ExecutionContextRef     `json:"executionRef"`
-		Asset          string                  `json:"asset"`
-		Chain          string                  `json:"chain"`
-		Contract       string                  `json:"contract"`
-		Function       string                  `json:"function"`
-		PolicyBinding  PolicyBinding           `json:"policyBinding"`
-		RiskLinkage    RiskLinkage             `json:"riskLinkage"`
+		Intent         *FinancialIntent       `json:"intent"`
+		Execution      *ExecutionHints        `json:"execution"`
+		Authority      *AuthorityReferences   `json:"authority"`
+		Metadata       map[string]interface{} `json:"metadata"`
+		IntentID       string                 `json:"intentId"`
+		ActorType      ActorType              `json:"actorType"`
+		ActorID        string                 `json:"actorId"`
+		Action         FinancialAction        `json:"action"`
+		AssetID        string                 `json:"assetId"`
+		Amount         *float64               `json:"amount"`
+		ChainID        string                 `json:"chainId"`
+		Recipient      string                 `json:"recipient"`
+		Venue          string                 `json:"venue"`
+		Purpose        string                 `json:"purpose"`
+		MandateID      string                 `json:"mandateId"`
+		PolicyVersion  string                 `json:"policyVersion"`
+		CorrelationID  string                 `json:"correlationId"`
+		IdempotencyKey string                 `json:"idempotencyKey"`
+		ExpiresAt      time.Time              `json:"expiresAt"`
+		AgentID        string                 `json:"agentId"`
+		CapabilityID   string                 `json:"capabilityId"`
+		Nonce          string                 `json:"nonce"`
+		AutonomyLevel  AutonomyLevel          `json:"autonomyLevel"`
+		ExecutionRef   ExecutionContextRef    `json:"executionRef"`
+		Asset          string                 `json:"asset"`
+		Chain          string                 `json:"chain"`
+		Contract       string                 `json:"contract"`
+		Function       string                 `json:"function"`
+		PolicyBinding  PolicyBinding          `json:"policyBinding"`
+		RiskLinkage    RiskLinkage            `json:"riskLinkage"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()

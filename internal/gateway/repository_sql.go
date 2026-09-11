@@ -35,6 +35,10 @@ func OpenSQLRepository(dsn string) (*SQLRepository, error) {
 }
 
 func applyMigrations(db *sql.DB) error {
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)`)
+	if err != nil {
+		return err
+	}
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		return fmt.Errorf("cannot locate migrations")
@@ -53,8 +57,19 @@ func applyMigrations(db *sql.DB) error {
 		if err != nil {
 			return err
 		}
+		var applied string
+		switch err := db.QueryRow(`SELECT name FROM schema_migrations WHERE name = ?`, entry.Name()).Scan(&applied); err {
+		case nil:
+			continue
+		case sql.ErrNoRows:
+		default:
+			return err
+		}
 		if _, err := db.Exec(string(content)); err != nil {
 			return fmt.Errorf("apply %s: %w", entry.Name(), err)
+		}
+		if _, err := db.Exec(`INSERT INTO schema_migrations(name) VALUES(?)`, entry.Name()); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -265,10 +280,12 @@ func (r *SQLRepository) ListAuditEvents(intentID string) ([]AuditEvent, error) {
 	for rows.Next() {
 		var event AuditEvent
 		var intentID, actorID, agentID, mandateID, policyVersion, riskID, authID, corrID, reason sql.NullString
-		if err := rows.Scan(&event.EventID, &event.Timestamp, &intentID, &actorID, &agentID, &mandateID, &policyVersion, &riskID, &authID, &corrID, &event.Decision, &reason, &event.Actor, &event.Hash, &event.PrevHash); err != nil {
+		var createdAt flexibleTime
+		var prevHash sql.NullString
+		if err := rows.Scan(&event.EventID, &createdAt, &intentID, &actorID, &agentID, &mandateID, &policyVersion, &riskID, &authID, &corrID, &event.Decision, &reason, &event.Actor, &event.Hash, &prevHash); err != nil {
 			return nil, err
 		}
-		event.Timestamp = event.Timestamp.UTC()
+		event.Timestamp = createdAt.Time.UTC()
 		event.IntentID = intentID.String
 		event.ActorID = actorID.String
 		event.AgentID = agentID.String
@@ -278,6 +295,7 @@ func (r *SQLRepository) ListAuditEvents(intentID string) ([]AuditEvent, error) {
 		event.AuthorizationID = authID.String
 		event.CorrelationID = corrID.String
 		event.ReasonCode = reason.String
+		event.PrevHash = prevHash.String
 		events = append(events, event)
 	}
 	return events, rows.Err()
@@ -355,8 +373,8 @@ func (r *SQLRepository) SaveIntent(record IntentRecord) error {
 	_, err := r.db.Exec(`
 		INSERT INTO agent_actions(
 			action_id, intent_id, agent_id, mandate_id, capability_id, status, decision, reason_code, idempotency_key, nonce, request_hash, amount, window_bucket, risk_reference, policy_version, policy_hash, expires_at, approved_at, cancelled_at, forwarded_at,
-			actor_type, actor_id, action_name, asset_id, chain_id, recipient, venue, purpose, correlation_id, policy_decision_id, risk_assessment_id, authorization_id, policy_outcome, replay_window_bucket, execution_contract, execution_function, execution_call_target, metadata_json, deprecation_warnings_json
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			actor_type, actor_id, action_name, asset_id, chain_id, recipient, venue, purpose, correlation_id, policy_decision_id, risk_assessment_id, authorization_id, policy_outcome, replay_window_bucket, execution_contract, execution_function, execution_call_target, metadata_json, deprecation_warnings_json, updated_at, downstream_reference
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		newActionID(record.Intent.IntentID),
 		record.Intent.IntentID,
@@ -397,6 +415,8 @@ func (r *SQLRepository) SaveIntent(record IntentRecord) error {
 		nullableString(record.Execution.ExecutionRef.CallTarget),
 		nullableJSON(record.Metadata),
 		nullableJSON(record.DeprecationWarnings),
+		record.UpdatedAt.UTC(),
+		nullableString(record.DownstreamReference),
 	)
 	return err
 }
@@ -463,7 +483,7 @@ func (r *SQLRepository) RevokeCapability(capabilityID string, now time.Time) err
 const intentRecordSelect = `
 	SELECT intent_id, actor_type, actor_id, action_name, asset_id, amount, chain_id, recipient, venue, purpose, mandate_id, policy_version, correlation_id, idempotency_key, expires_at,
 		agent_id, capability_id, nonce, execution_contract, execution_function, execution_call_target,
-		status, reason_code, request_hash, forwarded_at, created_at, COALESCE(updated_at, created_at), approved_at, cancelled_at, policy_decision_id, risk_assessment_id, authorization_id, policy_outcome, metadata_json, deprecation_warnings_json, downstream_reference
+		status, reason_code, request_hash, forwarded_at, created_at, updated_at, approved_at, cancelled_at, policy_decision_id, risk_assessment_id, authorization_id, policy_outcome, metadata_json, deprecation_warnings_json, downstream_reference
 	FROM agent_actions`
 
 type scanner interface {
@@ -474,7 +494,8 @@ func scanIntentRecord(row scanner) (IntentRecord, error) {
 	var record IntentRecord
 	var chainID, recipient, venue, execContract, execFunction, execCallTarget sql.NullString
 	var reasonCode sql.NullString
-	var forwardedAt, approvedAt, cancelledAt sql.NullTime
+	var forwardedAt, approvedAt, cancelledAt flexibleTime
+	var expiresAt, createdAt, updatedAt flexibleTime
 	var policyDecisionID, riskAssessmentID, authorizationID, policyOutcome sql.NullString
 	var metadataJSON, warningsJSON, downstreamRef sql.NullString
 	if err := row.Scan(
@@ -492,7 +513,7 @@ func scanIntentRecord(row scanner) (IntentRecord, error) {
 		&record.Intent.PolicyVersion,
 		&record.Intent.CorrelationID,
 		&record.Intent.IdempotencyKey,
-		&record.Intent.ExpiresAt,
+		&expiresAt,
 		&record.Execution.AgentID,
 		&record.Execution.CapabilityID,
 		&record.Execution.Nonce,
@@ -503,8 +524,8 @@ func scanIntentRecord(row scanner) (IntentRecord, error) {
 		&reasonCode,
 		&record.RequestHash,
 		&forwardedAt,
-		&record.CreatedAt,
-		&record.UpdatedAt,
+		&createdAt,
+		&updatedAt,
 		&approvedAt,
 		&cancelledAt,
 		&policyDecisionID,
@@ -517,9 +538,9 @@ func scanIntentRecord(row scanner) (IntentRecord, error) {
 	); err != nil {
 		return IntentRecord{}, err
 	}
-	record.Intent.ExpiresAt = record.Intent.ExpiresAt.UTC()
-	record.CreatedAt = record.CreatedAt.UTC()
-	record.UpdatedAt = record.UpdatedAt.UTC()
+	record.Intent.ExpiresAt = expiresAt.Time.UTC()
+	record.CreatedAt = createdAt.Time.UTC()
+	record.UpdatedAt = updatedAt.Time.UTC()
 	record.Intent.ChainID = chainID.String
 	record.Intent.Recipient = recipient.String
 	record.Intent.Venue = venue.String
@@ -528,8 +549,8 @@ func scanIntentRecord(row scanner) (IntentRecord, error) {
 	record.Execution.ExecutionRef.CallTarget = execCallTarget.String
 	record.ReasonCode = reasonCode.String
 	record.Forwarded = forwardedAt.Valid
-	record.ApprovedAt = nullTimePtr(approvedAt)
-	record.CancelledAt = nullTimePtr(cancelledAt)
+	record.ApprovedAt = flexibleTimePtr(approvedAt)
+	record.CancelledAt = flexibleTimePtr(cancelledAt)
 	record.Authority.PolicyDecisionID = policyDecisionID.String
 	record.Authority.RiskAssessmentID = riskAssessmentID.String
 	record.Authority.AuthorizationID = authorizationID.String
@@ -613,6 +634,57 @@ func timePtrValue(value *time.Time) interface{} {
 }
 
 func nullTimePtr(value sql.NullTime) *time.Time {
+	if !value.Valid {
+		return nil
+	}
+	t := value.Time.UTC()
+	return &t
+}
+
+type flexibleTime struct {
+	Time  time.Time
+	Valid bool
+}
+
+func (f *flexibleTime) Scan(src interface{}) error {
+	if src == nil {
+		f.Valid = false
+		f.Time = time.Time{}
+		return nil
+	}
+	switch v := src.(type) {
+	case time.Time:
+		f.Time = v.UTC()
+	case string:
+		t, err := parseTime(v)
+		if err != nil {
+			return err
+		}
+		f.Time = t
+	case []byte:
+		t, err := parseTime(string(v))
+		if err != nil {
+			return err
+		}
+		f.Time = t
+	default:
+		return fmt.Errorf("unsupported time type %T", src)
+	}
+	f.Valid = true
+	return nil
+}
+
+func parseTime(value string) (time.Time, error) {
+	layouts := []string{time.RFC3339Nano, "2006-01-02 15:04:05.999999999-07:00", "2006-01-02 15:04:05.999999999", "2006-01-02 15:04:05"}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, value); err == nil {
+			return t.UTC(), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("cannot parse time %q", value)
+}
+
+func flexibleTimePtr(value flexibleTime) *time.Time {
 	if !value.Valid {
 		return nil
 	}

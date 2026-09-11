@@ -77,10 +77,10 @@ type Repository interface {
 }
 
 type Service struct {
-	repo      Repository
-	resolver  PolicyRiskResolver
-	cfg       Config
-	sequence  atomic.Uint64
+	repo     Repository
+	resolver PolicyRiskResolver
+	cfg      Config
+	sequence atomic.Uint64
 }
 
 func NewService(cfg Config, repo Repository, resolver PolicyRiskResolver) *Service {
@@ -336,12 +336,12 @@ func (s *Service) SuspendAgent(agentID string, actor authenticatedActor, now tim
 		return err
 	}
 	return s.repo.AppendAudit(AuditEvent{
-		EventID:   s.newID("evt"),
-		Timestamp: now.UTC(),
-		AgentID:   agentID,
-		Decision:  "suspended",
-		ReasonCode:"DOWNSTREAM_PREVENTION_SIGNALLED",
-		Actor:     actor.Actor,
+		EventID:    s.newID("evt"),
+		Timestamp:  now.UTC(),
+		AgentID:    agentID,
+		Decision:   "suspended",
+		ReasonCode: "DOWNSTREAM_PREVENTION_SIGNALLED",
+		Actor:      actor.Actor,
 	}, map[string]interface{}{"signal": "agent:" + agentID})
 }
 
@@ -460,7 +460,7 @@ func (s *Service) autonomyAllowed(levels ...AutonomyLevel) bool {
 
 func (s *Service) forward(intent FinancialIntent) string {
 	downstream, _ := routeDownstream(intent.Action)
-	return downstream + ":" + s.hashString(intent.IntentID+intent.CorrelationID)[:12]
+	return downstream + ":" + s.hashString(intent.IntentID + intent.CorrelationID)[:12]
 }
 
 func (s *Service) audit(record IntentRecord, actor string, now time.Time, decision, reason string) error {

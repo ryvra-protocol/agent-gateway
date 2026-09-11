@@ -183,11 +183,11 @@ type RiskLinkage struct {
 }
 
 type SubmitIntentRequest struct {
-	Intent              FinancialIntent         `json:"intent"`
-	Execution           ExecutionHints          `json:"execution"`
-	Authority           AuthorityReferences     `json:"authority,omitempty"`
-	Metadata            map[string]interface{}  `json:"metadata,omitempty"`
-	DeprecationWarnings []string                `json:"deprecationWarnings,omitempty"`
+	Intent              FinancialIntent        `json:"intent"`
+	Execution           ExecutionHints         `json:"execution"`
+	Authority           AuthorityReferences    `json:"authority,omitempty"`
+	Metadata            map[string]interface{} `json:"metadata,omitempty"`
+	DeprecationWarnings []string               `json:"deprecationWarnings,omitempty"`
 }
 
 type IntentRecord struct {
@@ -225,32 +225,32 @@ type DecisionEnvelope struct {
 }
 
 type AuditEvent struct {
-	EventID           string    `json:"eventId"`
-	Timestamp         time.Time `json:"timestamp"`
-	IntentID          string    `json:"intentId,omitempty"`
-	ActorID           string    `json:"actorId,omitempty"`
-	AgentID           string    `json:"agentId,omitempty"`
-	MandateID         string    `json:"mandateId,omitempty"`
-	PolicyVersion     string    `json:"policyVersion,omitempty"`
-	RiskAssessmentID  string    `json:"riskAssessmentId,omitempty"`
-	AuthorizationID   string    `json:"authorizationId,omitempty"`
-	CorrelationID     string    `json:"correlationId,omitempty"`
-	Decision          string    `json:"decision"`
-	ReasonCode        string    `json:"reasonCode,omitempty"`
-	Actor             string    `json:"actor"`
-	Hash              string    `json:"hash"`
-	PrevHash          string    `json:"prevHash,omitempty"`
+	EventID          string    `json:"eventId"`
+	Timestamp        time.Time `json:"timestamp"`
+	IntentID         string    `json:"intentId,omitempty"`
+	ActorID          string    `json:"actorId,omitempty"`
+	AgentID          string    `json:"agentId,omitempty"`
+	MandateID        string    `json:"mandateId,omitempty"`
+	PolicyVersion    string    `json:"policyVersion,omitempty"`
+	RiskAssessmentID string    `json:"riskAssessmentId,omitempty"`
+	AuthorizationID  string    `json:"authorizationId,omitempty"`
+	CorrelationID    string    `json:"correlationId,omitempty"`
+	Decision         string    `json:"decision"`
+	ReasonCode       string    `json:"reasonCode,omitempty"`
+	Actor            string    `json:"actor"`
+	Hash             string    `json:"hash"`
+	PrevHash         string    `json:"prevHash,omitempty"`
 }
 
 type Config struct {
-	AdminReadToken    string
-	AdminWriteToken   string
-	KillSwitchToken   string
-	ApprovalToken     string
-	DatabaseURL       string
-	ReplayWindow      time.Duration
-	RateLimitWindow   time.Duration
-	DefaultRateLimit  int
-	DefaultSpendLimit float64
+	AdminReadToken     string
+	AdminWriteToken    string
+	KillSwitchToken    string
+	ApprovalToken      string
+	DatabaseURL        string
+	ReplayWindow       time.Duration
+	RateLimitWindow    time.Duration
+	DefaultRateLimit   int
+	DefaultSpendLimit  float64
 	DefaultReviewLimit float64
 }
