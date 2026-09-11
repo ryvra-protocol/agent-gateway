@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -10,60 +12,81 @@ import (
 )
 
 func main() {
-	adminToken := os.Getenv("ADMIN_TOKEN")
-	if adminToken == "" {
-		adminToken = "admin-token"
+	cfg, addr, resolver, err := loadRuntime()
+	if err != nil {
+		log.Fatal(err)
 	}
+	repo, err := gateway.OpenSQLRepository(cfg.DatabaseURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	svc := gateway.NewService(cfg, repo, resolver)
+	log.Printf("agent gateway listening on %s", addr)
+	log.Fatal(http.ListenAndServe(addr, gateway.NewHandler(svc)))
+}
 
-	svc := gateway.NewService(gateway.Config{
-		AdminToken:         adminToken,
+func loadRuntime() (gateway.Config, string, gateway.PolicyRiskResolver, error) {
+	cfg, addr, err := loadConfigFromEnv(os.Getenv)
+	if err != nil {
+		return gateway.Config{}, "", nil, err
+	}
+	resolver, err := loadResolverFromEnv(os.Getenv)
+	if err != nil {
+		return gateway.Config{}, "", nil, err
+	}
+	return cfg, addr, resolver, nil
+}
+
+func loadConfigFromEnv(getenv func(string) string) (gateway.Config, string, error) {
+	databaseURL := getenv("DATABASE_URL")
+	if databaseURL == "" {
+		return gateway.Config{}, "", errors.New("DATABASE_URL is required")
+	}
+	adminWrite := getenv("ADMIN_WRITE_TOKEN")
+	if adminWrite == "" {
+		adminWrite = getenv("ADMIN_TOKEN")
+	}
+	if adminWrite == "" {
+		return gateway.Config{}, "", errors.New("ADMIN_WRITE_TOKEN or ADMIN_TOKEN is required")
+	}
+	adminRead := getenv("ADMIN_READ_TOKEN")
+	if adminRead == "" {
+		adminRead = adminWrite
+	}
+	cfg := gateway.Config{
+		AdminReadToken:     adminRead,
+		AdminWriteToken:    adminWrite,
+		KillSwitchToken:    fallback(getenv("KILLSWITCH_ADMIN_TOKEN"), adminWrite),
+		ApprovalToken:      fallback(getenv("APPROVAL_ADMIN_TOKEN"), adminWrite),
+		DatabaseURL:        databaseURL,
 		ReplayWindow:       5 * time.Minute,
 		RateLimitWindow:    time.Minute,
 		DefaultRateLimit:   30,
 		DefaultSpendLimit:  10000,
 		DefaultReviewLimit: 1000,
-	})
-
-	svc.SeedAgent(gateway.Agent{
-		ID:             "agent-demo",
-		Status:         gateway.AgentStatusActive,
-		RateLimit:      30,
-		SpendLimit:     10000,
-		ReviewLimit:    1000,
-		AutonomyLevel:  gateway.AutonomyA2,
-		SessionBinding: "session-demo",
-	})
-	svc.SeedCredential(gateway.AgentCredential{
-		ID:        "cred-demo",
-		AgentID:   "agent-demo",
-		Token:     "agent-token",
-		SessionID: "session-demo",
-		ExpiresAt: time.Now().Add(time.Hour),
-	})
-	svc.SeedCapability(gateway.AgentCapability{
-		ID:               "cap-demo",
-		AgentID:          "agent-demo",
-		AllowedActions:   []string{"TRANSFER", "BALANCE_CHECK"},
-		AllowedAssets:    []string{"USD", "USDC"},
-		AllowedChains:    []string{"solana"},
-		AllowedContracts: []string{"treasury-vault"},
-		AllowedFunctions: []string{"transfer", "balanceOf"},
-		AutonomyLevel:    gateway.AutonomyA2,
-		Status:           gateway.RecordStatusActive,
-	})
-	svc.SeedMandate(gateway.AgentMandate{
-		ID:            "mandate-demo",
-		AgentID:       "agent-demo",
-		AutonomyLevel: gateway.AutonomyA2,
-		Status:        gateway.RecordStatusActive,
-		ExpiresAt:     time.Now().Add(24 * time.Hour),
-	})
-
-	addr := os.Getenv("ADDR")
+	}
+	addr := getenv("ADDR")
 	if addr == "" {
 		addr = ":8080"
 	}
+	return cfg, addr, nil
+}
 
-	log.Printf("agent gateway listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, gateway.NewHandler(svc, adminToken)))
+func loadResolverFromEnv(getenv func(string) string) (gateway.PolicyRiskResolver, error) {
+	lookupsJSON := getenv("POLICY_RISK_LOOKUPS_JSON")
+	if lookupsJSON == "" {
+		return gateway.StaticPolicyRiskResolver{}, nil
+	}
+	lookups := map[string]gateway.AuthorityReferences{}
+	if err := json.Unmarshal([]byte(lookupsJSON), &lookups); err != nil {
+		return nil, err
+	}
+	return gateway.StaticPolicyRiskResolver{Lookups: lookups}, nil
+}
+
+func fallback(value, alternative string) string {
+	if value != "" {
+		return value
+	}
+	return alternative
 }
