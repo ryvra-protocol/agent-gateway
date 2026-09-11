@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -24,23 +23,23 @@ type authenticatedActor struct {
 }
 
 type Service struct {
-	mu                sync.RWMutex
-	cfg               Config
-	agents            map[string]Agent
-	credentialsByID   map[string]AgentCredential
+	mu                 sync.RWMutex
+	cfg                Config
+	agents             map[string]Agent
+	credentialsByID    map[string]AgentCredential
 	credentialsByToken map[string]string
-	capabilities      map[string]AgentCapability
-	mandates          map[string]AgentMandate
-	intents           map[string]IntentRecord
-	idempotency       map[string]string
-	nonces            map[string]time.Time
-	agentRequests     map[string][]time.Time
-	agentSpend        map[string][]spendEntry
-	auditEvents       []AuditEvent
-	lastAuditHash     string
-	killSwitch        bool
-	preventionSignals []string
-	nextID            int
+	capabilities       map[string]AgentCapability
+	mandates           map[string]AgentMandate
+	intents            map[string]IntentRecord
+	idempotency        map[string]string
+	nonces             map[string]time.Time
+	agentRequests      map[string][]time.Time
+	agentSpend         map[string][]spendEntry
+	auditEvents        []AuditEvent
+	lastAuditHash      string
+	killSwitch         bool
+	preventionSignals  []string
+	nextID             int
 }
 
 type spendEntry struct {
@@ -163,7 +162,7 @@ func (s *Service) ProcessIntent(intent FinancialIntent, actor authenticatedActor
 	if intent.PolicyBinding.Version == "" || intent.PolicyBinding.Hash == "" {
 		return s.rejectIntent(intent, now, actor.Actor, DecisionDenied, "MISSING_POLICY_BINDING"), nil
 	}
-	if intent.Nonce == "" || intent.Action == "" || intent.Asset == "" || intent.Contract == "" || intent.Function == "" {
+	if intent.Nonce == "" || intent.Action == "" || intent.Asset == "" || intent.Contract == "" || intent.Function == "" || intent.Amount <= 0 {
 		return s.rejectIntent(intent, now, actor.Actor, DecisionDenied, "MALFORMED_INTENT"), nil
 	}
 	if intent.ExpiresAt.IsZero() || now.After(intent.ExpiresAt) {
@@ -189,6 +188,9 @@ func (s *Service) ProcessIntent(intent FinancialIntent, actor authenticatedActor
 	if !ok || capability.AgentID != intent.AgentID || capability.Status != RecordStatusActive || (capability.ExpiresAt != nil && now.After(*capability.ExpiresAt)) || capability.RevokedAt != nil {
 		return s.rejectIntent(intent, now, actor.Actor, DecisionDenied, "CAPABILITY_REVOKED_OR_EXPIRED"), nil
 	}
+	if mapActionToService(intent.Action) == "blocked" {
+		return s.rejectIntent(intent, now, actor.Actor, DecisionDenied, "UNSUPPORTED_ACTION"), nil
+	}
 	if !s.capabilityPermits(capability, intent) {
 		return s.rejectIntent(intent, now, actor.Actor, DecisionDenied, "UNSUPPORTED_ACTION"), nil
 	}
@@ -199,13 +201,13 @@ func (s *Service) ProcessIntent(intent FinancialIntent, actor authenticatedActor
 
 	policyRef := intent.PolicyBinding.DecisionRef
 	if policyRef == "" {
-		policyRef = "policy:" + s.hashString(intent.PolicyBinding.Version+":"+intent.PolicyBinding.Hash)[:12]
+		policyRef = "policy:" + s.hashString(intent.PolicyBinding.Version + ":" + intent.PolicyBinding.Hash)[:12]
 		intent.PolicyBinding.DecisionRef = policyRef
 	}
 	s.audit(now, intentID, intent.AgentID, intent.MandateID, "policy_checked", "", actor.Actor)
 
 	if intent.RiskLinkage.Reference == "" {
-		intent.RiskLinkage.Reference = "risk:" + s.hashString(intentID+":"+intent.CorrelationID)[:12]
+		intent.RiskLinkage.Reference = "risk:" + s.hashString(intentID + ":" + intent.CorrelationID)[:12]
 	}
 	if intent.RiskLinkage.DecisionRef == "" {
 		intent.RiskLinkage.DecisionRef = intent.RiskLinkage.Reference
@@ -315,7 +317,7 @@ func (s *Service) CancelIntent(intentID string, actor authenticatedActor, now ti
 	record.UpdatedAt = now
 	record.CancelledAt = ptrTime(now)
 	s.intents[intentID] = record
-	s.audit(now, intentID, record.AgentID, record.MandateID, "blocked", "CANCELLED", actor.Actor)
+	s.audit(now, intentID, record.AgentID, record.MandateID, "cancelled", "CANCELLED", actor.Actor)
 	return envelope(record), nil
 }
 
@@ -425,10 +427,6 @@ func (s *Service) VerifyAuditIntegrity() bool {
 	return true
 }
 
-func (s *Service) rejectIntent(intent FinancialIntent, now time.Time, actor, decisionReason string, decision Decision) DecisionEnvelope {
-	panic("unreachable")
-}
-
 func (s *Service) rejectIntent(intent FinancialIntent, now time.Time, actor string, decision Decision, reason string) DecisionEnvelope {
 	record := IntentRecord{
 		FinancialIntent: intent,
@@ -439,7 +437,11 @@ func (s *Service) rejectIntent(intent FinancialIntent, now time.Time, actor stri
 		RequestHash:     s.intentHash(intent),
 	}
 	s.intents[intent.IntentID] = record
-	s.audit(now, intent.IntentID, intent.AgentID, intent.MandateID, "blocked", reason, actor)
+	stage := strings.ToLower(string(decision))
+	if decision == DecisionDenied {
+		stage = "denied"
+	}
+	s.audit(now, intent.IntentID, intent.AgentID, intent.MandateID, stage, reason, actor)
 	return envelope(record)
 }
 
@@ -502,7 +504,7 @@ func (s *Service) autonomyAllowed(levels ...AutonomyLevel) bool {
 }
 
 func (s *Service) forward(intent FinancialIntent) string {
-	return mapActionToService(intent.Action) + ":" + s.hashString(intent.IntentID+intent.CorrelationID)[:12]
+	return mapActionToService(intent.Action) + ":" + s.hashString(intent.IntentID + intent.CorrelationID)[:12]
 }
 
 func (s *Service) audit(now time.Time, intentID, agentID, mandateID, decision, reasonCode, actor string) {
@@ -583,10 +585,4 @@ func mapActionToService(action string) string {
 
 func ptrTime(t time.Time) *time.Time {
 	return &t
-}
-
-func normalizeEvents(events []AuditEvent) {
-	sort.Slice(events, func(i, j int) bool {
-		return events[i].Timestamp.Before(events[j].Timestamp)
-	})
 }

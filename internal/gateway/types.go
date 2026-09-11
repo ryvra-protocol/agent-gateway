@@ -46,14 +46,14 @@ var autonomyRank = map[AutonomyLevel]int{
 }
 
 type Agent struct {
-	ID             string       `json:"agentId"`
-	Status         AgentStatus  `json:"status"`
-	RateLimit      int          `json:"rateLimit"`
-	SpendLimit     float64      `json:"spendLimit"`
-	ReviewLimit    float64      `json:"reviewLimit"`
-	AutonomyLevel  AutonomyLevel`json:"autonomyLevel"`
-	SessionBinding string       `json:"sessionBinding,omitempty"`
-	SuspendedAt    *time.Time   `json:"suspendedAt,omitempty"`
+	ID             string        `json:"agentId"`
+	Status         AgentStatus   `json:"status"`
+	RateLimit      int           `json:"rateLimit"`
+	SpendLimit     float64       `json:"spendLimit"`
+	ReviewLimit    float64       `json:"reviewLimit"`
+	AutonomyLevel  AutonomyLevel `json:"autonomyLevel"`
+	SessionBinding string        `json:"sessionBinding,omitempty"`
+	SuspendedAt    *time.Time    `json:"suspendedAt,omitempty"`
 }
 
 type AgentCredential struct {
@@ -140,15 +140,15 @@ type IntentRecord struct {
 }
 
 type DecisionEnvelope struct {
-	IntentID             string   `json:"intentId"`
-	Decision             Decision `json:"decision"`
-	Status               Decision `json:"status"`
-	ReasonCode           string   `json:"reasonCode,omitempty"`
-	Forwarded            bool     `json:"forwarded"`
-	ApprovalRequired     bool     `json:"approvalRequired"`
-	DownstreamReference  string   `json:"downstreamReference,omitempty"`
-	PolicyDecisionRef    string   `json:"policyDecisionRef,omitempty"`
-	RiskReference        string   `json:"riskReference,omitempty"`
+	IntentID            string   `json:"intentId"`
+	Decision            Decision `json:"decision"`
+	Status              Decision `json:"status"`
+	ReasonCode          string   `json:"reasonCode,omitempty"`
+	Forwarded           bool     `json:"forwarded"`
+	ApprovalRequired    bool     `json:"approvalRequired"`
+	DownstreamReference string   `json:"downstreamReference,omitempty"`
+	PolicyDecisionRef   string   `json:"policyDecisionRef,omitempty"`
+	RiskReference       string   `json:"riskReference,omitempty"`
 }
 
 type AuditEvent struct {
