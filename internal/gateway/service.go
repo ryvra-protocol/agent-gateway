@@ -199,6 +199,8 @@ func (s *Service) ProcessIntent(intent FinancialIntent, actor authenticatedActor
 	}
 	s.audit(now, intentID, intent.AgentID, intent.MandateID, "capability_checked", "", actor.Actor)
 
+	requestHash := s.requestHash(intent)
+
 	policyRef := intent.PolicyBinding.DecisionRef
 	if policyRef == "" {
 		policyRef = "policy:" + s.hashString(intent.PolicyBinding.Version + ":" + intent.PolicyBinding.Hash)[:12]
@@ -214,7 +216,6 @@ func (s *Service) ProcessIntent(intent FinancialIntent, actor authenticatedActor
 	}
 	s.audit(now, intentID, intent.AgentID, intent.MandateID, "risk_checked", "", actor.Actor)
 
-	requestHash := s.intentHash(intent)
 	idempotencyKey := intent.AgentID + ":" + intent.IdempotencyKey
 	if existingID, ok := s.idempotency[idempotencyKey]; ok {
 		existing := s.intents[existingID]
@@ -540,6 +541,16 @@ func (s *Service) intentHash(intent FinancialIntent) string {
 	type alias FinancialIntent
 	b, _ := json.Marshal(alias(intent))
 	return s.hashString(string(b))
+}
+
+func (s *Service) requestHash(intent FinancialIntent) string {
+	intent.IntentID = ""
+	intent.IssuedAt = time.Time{}
+	intent.ExpiresAt = time.Time{}
+	intent.PolicyBinding.DecisionRef = ""
+	intent.RiskLinkage.Reference = ""
+	intent.RiskLinkage.DecisionRef = ""
+	return s.intentHash(intent)
 }
 
 func (s *Service) hashString(value string) string {

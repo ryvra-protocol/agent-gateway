@@ -9,13 +9,15 @@ import (
 	"time"
 )
 
+const testAgentToken = "test-agent-token"
+
 func TestIntentLifecycleAndControls(t *testing.T) {
 	svc := seededService()
 	handler := NewHandler(svc, "admin-token")
 
 	intent := validIntent()
 	res := performJSON(t, handler, http.MethodPost, "/v1/intents", intent, map[string]string{
-		"Authorization": "******",
+		"Authorization": "Bearer " + testAgentToken,
 		"X-Session-ID":  "session-1",
 	})
 	if res.Code != http.StatusOK {
@@ -59,7 +61,7 @@ func TestAuthFailures(t *testing.T) {
 		handler := NewHandler(svc, "admin-token")
 
 		res := performJSON(t, handler, http.MethodPost, "/v1/intents", validIntent(), map[string]string{
-			"Authorization": "******",
+			"Authorization": "Bearer " + testAgentToken,
 			"X-Session-ID":  "session-1",
 		})
 		if res.Code != http.StatusUnauthorized {
@@ -75,7 +77,7 @@ func TestAuthFailures(t *testing.T) {
 		handler := NewHandler(svc, "admin-token")
 
 		res := performJSON(t, handler, http.MethodPost, "/v1/intents", validIntent(), map[string]string{
-			"Authorization": "******",
+			"Authorization": "Bearer " + testAgentToken,
 			"X-Session-ID":  "session-1",
 		})
 		if res.Code != http.StatusUnauthorized {
@@ -91,7 +93,7 @@ func TestAuthFailures(t *testing.T) {
 		handler := NewHandler(svc, "admin-token")
 
 		res := performJSON(t, handler, http.MethodPost, "/v1/intents", validIntent(), map[string]string{
-			"Authorization": "******",
+			"Authorization": "Bearer " + testAgentToken,
 			"X-Session-ID":  "session-1",
 		})
 		if res.Code != http.StatusForbidden {
@@ -109,7 +111,7 @@ func TestAuthFailures(t *testing.T) {
 		handler := NewHandler(svc, "admin-token")
 
 		res := performJSON(t, handler, http.MethodPost, "/v1/intents", validIntent(), map[string]string{
-			"Authorization": "******",
+			"Authorization": "Bearer " + testAgentToken,
 			"X-Session-ID":  "session-1",
 		})
 		assertReasonCode(t, res, "CAPABILITY_REVOKED_OR_EXPIRED")
@@ -125,7 +127,7 @@ func TestAuthFailures(t *testing.T) {
 		handler := NewHandler(svc, "admin-token")
 
 		res := performJSON(t, handler, http.MethodPost, "/v1/intents", validIntent(), map[string]string{
-			"Authorization": "******",
+			"Authorization": "Bearer " + testAgentToken,
 			"X-Session-ID":  "session-1",
 		})
 		assertReasonCode(t, res, "MANDATE_REVOKED_OR_EXPIRED")
@@ -139,7 +141,7 @@ func TestRequestValidationReplayAndLimits(t *testing.T) {
 		intent := validIntent()
 		intent.Asset = ""
 		res := performJSON(t, handler, http.MethodPost, "/v1/intents", intent, map[string]string{
-			"Authorization": "******",
+			"Authorization": "Bearer " + testAgentToken,
 			"X-Session-ID":  "session-1",
 		})
 		assertReasonCode(t, res, "MALFORMED_INTENT")
@@ -151,7 +153,7 @@ func TestRequestValidationReplayAndLimits(t *testing.T) {
 		intent := validIntent()
 		intent.CorrelationID = ""
 		res := performJSON(t, handler, http.MethodPost, "/v1/intents", intent, map[string]string{
-			"Authorization": "******",
+			"Authorization": "Bearer " + testAgentToken,
 			"X-Session-ID":  "session-1",
 		})
 		assertReasonCode(t, res, "MISSING_AUTHORITY_FIELDS")
@@ -163,7 +165,7 @@ func TestRequestValidationReplayAndLimits(t *testing.T) {
 		intent := validIntent()
 		intent.ExpiresAt = time.Now().UTC().Add(-time.Minute)
 		res := performJSON(t, handler, http.MethodPost, "/v1/intents", intent, map[string]string{
-			"Authorization": "******",
+			"Authorization": "Bearer " + testAgentToken,
 			"X-Session-ID":  "session-1",
 		})
 		assertReasonCode(t, res, "INTENT_EXPIRED")
@@ -175,7 +177,7 @@ func TestRequestValidationReplayAndLimits(t *testing.T) {
 		intent := validIntent()
 		intent.Action = "SWAP"
 		res := performJSON(t, handler, http.MethodPost, "/v1/intents", intent, map[string]string{
-			"Authorization": "******",
+			"Authorization": "Bearer " + testAgentToken,
 			"X-Session-ID":  "session-1",
 		})
 		assertReasonCode(t, res, "UNSUPPORTED_ACTION")
@@ -184,7 +186,7 @@ func TestRequestValidationReplayAndLimits(t *testing.T) {
 	t.Run("duplicate idempotency key blocked", func(t *testing.T) {
 		svc := seededService()
 		handler := NewHandler(svc, "admin-token")
-		headers := map[string]string{"Authorization": "******", "X-Session-ID": "session-1"}
+		headers := map[string]string{"Authorization": "Bearer " + testAgentToken, "X-Session-ID": "session-1"}
 		performJSON(t, handler, http.MethodPost, "/v1/intents", validIntent(), headers)
 		res := performJSON(t, handler, http.MethodPost, "/v1/intents", validIntent(), headers)
 		assertReasonCode(t, res, "DUPLICATE_IDEMPOTENCY_KEY")
@@ -196,7 +198,7 @@ func TestRequestValidationReplayAndLimits(t *testing.T) {
 		intent := validIntent()
 		intent.IssuedAt = time.Now().UTC().Add(-10 * time.Minute)
 		res := performJSON(t, handler, http.MethodPost, "/v1/intents", intent, map[string]string{
-			"Authorization": "******",
+			"Authorization": "Bearer " + testAgentToken,
 			"X-Session-ID":  "session-1",
 		})
 		assertReasonCode(t, res, "STALE_NONCE")
@@ -205,7 +207,7 @@ func TestRequestValidationReplayAndLimits(t *testing.T) {
 	t.Run("altered payload with same key blocked", func(t *testing.T) {
 		svc := seededService()
 		handler := NewHandler(svc, "admin-token")
-		headers := map[string]string{"Authorization": "******", "X-Session-ID": "session-1"}
+		headers := map[string]string{"Authorization": "Bearer " + testAgentToken, "X-Session-ID": "session-1"}
 		performJSON(t, handler, http.MethodPost, "/v1/intents", validIntent(), headers)
 		intent := validIntent()
 		intent.Amount = 99
@@ -219,7 +221,7 @@ func TestRequestValidationReplayAndLimits(t *testing.T) {
 		agent.RateLimit = 1
 		svc.agents["agent-1"] = agent
 		handler := NewHandler(svc, "admin-token")
-		headers := map[string]string{"Authorization": "******", "X-Session-ID": "session-1"}
+		headers := map[string]string{"Authorization": "Bearer " + testAgentToken, "X-Session-ID": "session-1"}
 		intent1 := validIntent()
 		intent1.IdempotencyKey = "idem-rate-1"
 		intent1.Nonce = "nonce-rate-1"
@@ -238,7 +240,7 @@ func TestRequestValidationReplayAndLimits(t *testing.T) {
 		agent.ReviewLimit = 100
 		svc.agents["agent-1"] = agent
 		handler := NewHandler(svc, "admin-token")
-		headers := map[string]string{"Authorization": "******", "X-Session-ID": "session-1"}
+		headers := map[string]string{"Authorization": "Bearer " + testAgentToken, "X-Session-ID": "session-1"}
 		intent1 := validIntent()
 		intent1.IdempotencyKey = "idem-spend-1"
 		intent1.Nonce = "nonce-spend-1"
@@ -256,7 +258,7 @@ func TestRequestValidationReplayAndLimits(t *testing.T) {
 func TestApprovalAndKillSwitchFlows(t *testing.T) {
 	svc := seededService()
 	handler := NewHandler(svc, "admin-token")
-	headers := map[string]string{"Authorization": "******", "X-Session-ID": "session-1"}
+	headers := map[string]string{"Authorization": "Bearer " + testAgentToken, "X-Session-ID": "session-1"}
 
 	intent := validIntent()
 	intent.Amount = 5000
@@ -323,14 +325,14 @@ func seededService() *Service {
 		ReplayWindow:       5 * time.Minute,
 		RateLimitWindow:    time.Minute,
 		DefaultRateLimit:   10,
-		DefaultSpendLimit:  1000,
+		DefaultSpendLimit:  10000,
 		DefaultReviewLimit: 500,
 	})
 	svc.SeedAgent(Agent{
 		ID:             "agent-1",
 		Status:         AgentStatusActive,
 		RateLimit:      10,
-		SpendLimit:     1000,
+		SpendLimit:     10000,
 		ReviewLimit:    500,
 		AutonomyLevel:  AutonomyA2,
 		SessionBinding: "session-1",
@@ -338,7 +340,7 @@ func seededService() *Service {
 	svc.SeedCredential(AgentCredential{
 		ID:        "cred-1",
 		AgentID:   "agent-1",
-		Token:     "token-1",
+		Token:     testAgentToken,
 		SessionID: "session-1",
 		ExpiresAt: time.Now().UTC().Add(time.Hour),
 	})
