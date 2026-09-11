@@ -107,7 +107,7 @@ Optional scoped admin overrides:
 - `KILLSWITCH_ADMIN_TOKEN`
 - `APPROVAL_ADMIN_TOKEN`
 
-All admin and agent authentication uses `Authorization: ****** Startup fails if required secrets are missing.
+All admin and agent authentication uses the standard bearer Authorization header. Startup fails if required secrets are missing.
 
 ## Persistence and audit guarantees
 
